@@ -354,6 +354,10 @@
       color: #e66;
     }
 
+    .generation-actions { display: grid; gap: 8px; }
+    .auto-generate { display: flex; align-items: center; gap: 7px; margin-top: 12px; color: #b8bfc6; font-size: 11px; cursor: pointer; }
+    .queue-hint { margin: 8px 0 0; color: #a4a9af; font-size: 11px; line-height: 1.6; }
+
     /* ============ 列表 ============ */
     .list-header,
     .clip-row {
@@ -788,8 +792,13 @@
           <label for="genText">台词</label>
           <textarea id="genText" maxlength="10000" placeholder="输入台词…"></textarea>
         </div>
-        <button class="btn primary" id="genBtn">+ 加入生成队列</button>
-        <div class="gen-status" id="genStatus">就绪</div>
+        <div class="generation-actions">
+          <button class="btn" id="genBtn" title="Ctrl / ⌘ + Enter">+ 暂存任务</button>
+          <button class="btn primary" id="startBatchBtn" disabled>开始批量生成</button>
+        </div>
+        <label class="auto-generate"><input type="checkbox" id="autoGenerate" autocomplete="off" aria-describedby="queueHint">加入后自动生成</label>
+        <p class="queue-hint" id="queueHint" aria-live="polite">先暂存多条台词，再一起开始生成。</p>
+        <div class="gen-status" id="genStatus" role="status">就绪</div>
       </section>
 
       <details class="advanced-controls">
@@ -1109,8 +1118,15 @@
 
     // 队列
     const jobQueue = [];
-    let activeJob = null;
+    const activeJobs = new Map();
+    let activeBatches = 0;
+    let batchSubmissionSize = 1;
+    let parallelRequestLimit = 1;
+    let queueTimer = null;
+    let inferencePollTimer = null;
     let queueWorkerRunning = false;
+    const PENDING_JOBS_KEY = 'qwen3-tts-pending-jobs-v1';
+    let queuePersistenceAvailable = true;
 
     // ============================================================
     // DOM
@@ -1129,6 +1145,9 @@
     const genText = $("genText");
     const genBtn = $("genBtn");
     const genStatus = $("genStatus");
+    const startBatchBtn = $("startBatchBtn");
+    const autoGenerate = $("autoGenerate");
+    const queueHint = $("queueHint");
     const ptHint = $("ptHint");
 
     const defSpeaker = $("defSpeaker");
@@ -1219,6 +1238,7 @@
       clip.serverId = record.id;
       clip.url = record.available ? record.url : null;
       clip.duration = record.duration || 0;
+      clip.generation_stats = record.generation_stats || null;
       clip.created_at = record.created_at;
       const generated = record.generated || {};
       clip.generatedRole = generated.role ?? clip.role;
@@ -1230,7 +1250,7 @@
     }
 
     async function loadLibrary() {
-      if (queueWorkerRunning || playlistRunning || singlePlayingId !== null) { setStatus('任务结束后再刷新'); return; }
+      if (queueWorkerRunning || playlistRunning || singlePlayingId !== null) { setStatus('请先完成任务或取消暂存，再刷新语音库'); return; }
       try {
         await Promise.all(clips.map(clip => clip.saveError ? saveClip(clip) : clip.saving));
         const data = await (await apiRequest('/api/clips')).json();
@@ -1243,6 +1263,7 @@
           clips.push(clip);
         }
         libraryLoaded = true;
+        restorePendingJobs();
         setStatus('本地语音库已同步');
         renderList();
         updateGeneratorMode();
@@ -1284,6 +1305,9 @@
       try {
         const data = await (await apiRequest('/api/capabilities')).json();
         designCapability = data.voice_design;
+        batchSubmissionSize = Math.max(1, Math.min(32, data.inference?.max_request_items || 16));
+        parallelRequestLimit = data.inference?.mode === 'adaptive_batch' ? 2 : 1;
+        updateQueueControls();
         $('designModelStatus').textContent = 'VoiceDesign 1.7B · ' + (designCapability.installed ? '已安装' : designCapability.offline ? '未安装 · 离线模式' : '首次生成需下载模型');
       } catch (error) { $('designModelStatus').textContent = '模型检查失败：' + error.message; }
     }
@@ -1295,6 +1319,7 @@
       $('cloneFields').hidden = design;
       $('designFields').hidden = !design;
       genBtn.disabled = !libraryLoaded || (!design && !roleList.length);
+      updateQueueControls();
     }
 
     function openEdit(clip) {
@@ -1717,14 +1742,96 @@
     // 队列
     // ============================================================
     function enqueueJob(job) {
-      jobQueue.push(job);
-      updateStats();
+      if (activeJobs.has(job.clipId) || jobQueue.some(item => item.clipId === job.clipId)) return;
+      const clip = clips.find(c => c.id === job.clipId);
+      if (!clip) return;
+      clip.queued = true;
+      clip.error = null;
+      clip.inferenceLabel = null;
+      jobQueue.push({...job, released: autoGenerate.checked});
+      persistPendingJobs();
       renderList();
       processQueue();
     }
 
+    function startBatch() {
+      const staged = jobQueue.filter(job => !job.released);
+      if (!staged.length) return;
+      // Release only this snapshot. Later additions still need a new click.
+      staged.forEach(job => { job.released = true; });
+      renderList();
+      setGenStatus(`已开始 ${staged.length} 条任务`, 'ok');
+      processQueue();
+    }
+
+    function changeAutoGenerate() {
+      if (autoGenerate.checked) startBatch();
+      renderList();
+      setGenStatus(autoGenerate.checked ? '已开启自动生成' : '已切换为暂存，已开始的任务会继续', 'ok');
+    }
+
+    function cancelStagedJob(clipId) {
+      const index = jobQueue.findIndex(job => job.clipId === clipId && !job.released);
+      if (index < 0) return;
+      jobQueue.splice(index, 1);
+      const clip = clips.find(c => c.id === clipId);
+      if (clip) clip.queued = false;
+      persistPendingJobs();
+      renderList();
+      setStatus('已取消暂存，台词仍保留在语音库，可编辑后重新暂存');
+    }
+
+    function persistPendingJobs() {
+      try {
+        // Only store references to saved drafts. Submitted requests are never
+        // restored, so refreshing cannot accidentally generate them twice.
+        const pending = jobQueue.map(job => ({
+          serverId: clips.find(c => c.id === job.clipId)?.serverId,
+          allow_download: job.allow_download === true,
+        })).filter(item => item.serverId);
+        if (pending.length) sessionStorage.setItem(PENDING_JOBS_KEY, JSON.stringify(pending));
+        else sessionStorage.removeItem(PENDING_JOBS_KEY);
+        queuePersistenceAvailable = true;
+      } catch (error) { queuePersistenceAvailable = false; }
+    }
+
+    function restorePendingJobs() {
+      try {
+        const pending = JSON.parse(sessionStorage.getItem(PENDING_JOBS_KEY) || '[]');
+        if (!Array.isArray(pending)) return;
+        for (const item of pending) {
+          const clip = clips.find(c => c.serverId === item?.serverId);
+          if (!clip || !clip.text?.trim() || jobQueue.some(job => job.clipId === clip.id)) continue;
+          clip.queued = true;
+          jobQueue.push({clipId: clip.id, role: clip.role, emotion: clip.emotion,
+            text: clip.text.trim(), language: clip.language, instruct: clip.instruct,
+            synthesis_mode: clip.synthesis_mode, allow_download: item.allow_download === true,
+            released: false});
+        }
+        persistPendingJobs();
+      } catch (error) { queuePersistenceAvailable = false; }
+    }
+
+    function updateQueueControls() {
+      const staged = jobQueue.filter(job => !job.released).length;
+      const running = activeJobs.size + jobQueue.length - staged;
+      genBtn.textContent = autoGenerate.checked ? '+ 加入生成队列' : '+ 暂存任务';
+      genBtn.classList.toggle('primary', autoGenerate.checked);
+      startBatchBtn.hidden = autoGenerate.checked;
+      startBatchBtn.disabled = staged === 0;
+      startBatchBtn.textContent = staged ? `开始批量生成（${staged}）` : '开始批量生成';
+      queueHint.textContent = autoGenerate.checked ? '新增任务会立即进入生成队列。' :
+        staged ? `已暂存 ${staged} 条，点击开始后统一提交。` :
+        running ? '本批正在生成，可继续暂存下一批。' : '先暂存多条台词，再一起开始生成。';
+      if (staged && running) queueHint.textContent += ' 当前批次继续生成。';
+      if (!queuePersistenceAvailable) queueHint.textContent += ' 浏览器无法保存暂存队列，请勿刷新页面。';
+    }
+
     function updateStats() {
-      const pending = jobQueue.length + (activeJob ? 1 : 0);
+      const pending = jobQueue.length + activeJobs.size;
+      const staged = jobQueue.filter(job => !job.released).length;
+      queueWorkerRunning = pending > 0;
+      updateQueueControls();
       const ready = clips.filter(c => c.url).length;
       const total = clips.reduce((s, c) => s + (c.duration || 0), 0);
 
@@ -1738,7 +1845,10 @@
       footReady.textContent = ready;
 
       if (pending > 0) {
-        queueIndicator.textContent = "队列 " + pending;
+        const generating = clips.filter(c => c.generating).length;
+        const running = pending - staged;
+        queueIndicator.textContent = [running ? `生成 ${generating} · 待完成 ${running}` : '',
+          staged ? `暂存 ${staged}` : ''].filter(Boolean).join(' · ');
         queueIndicator.classList.add("on");
       } else {
         queueIndicator.classList.remove("on");
@@ -1750,77 +1860,133 @@
       updateSelection();
     }
 
-    async function processQueue() {
-      if (queueWorkerRunning) return;
-      queueWorkerRunning = true;
-
-      while (jobQueue.length > 0) {
-        const job = jobQueue.shift();
-        activeJob = job;
-        updateStats();
-        renderList();
-
-        const clip = clips.find(c => c.id === job.clipId);
-        if (clip) {
-          clip.queued = false;
-          clip.generating = true;
-          renderList();
+    function processQueue() {
+      if (queueTimer !== null || !jobQueue.some(job => job.released) || activeBatches >= parallelRequestLimit) return;
+      // Two HTTP requests can carry many jobs without occupying all browser
+      // connections. Actual GPU batch admission belongs to the server.
+      queueTimer = setTimeout(() => {
+        queueTimer = null;
+        while (jobQueue.some(job => job.released) && activeBatches < parallelRequestLimit) {
+          const jobs = jobQueue.filter(job => job.released).slice(0, batchSubmissionSize);
+          for (const job of jobs) jobQueue.splice(jobQueue.indexOf(job), 1);
+          persistPendingJobs();
+          jobs.forEach(job => activeJobs.set(job.clipId, job));
+          activeBatches++;
+          runJobs(jobs).finally(() => {
+            jobs.forEach(job => activeJobs.delete(job.clipId));
+            activeBatches--;
+            renderList();
+            processQueue();
+          });
         }
-
-        try {
-          await runJob(job);
-        } catch (e) {
-          console.error("[queue] job failed:", job, e);
-          const c2 = clips.find(c => c.id === job.clipId);
-          if (c2) { c2.generating = false; c2.queued = false; c2.error = e.message; }
-          setStatus("错误：" + e.message);
-          renderList();
-        }
-
-        activeJob = null;
         updateStats();
-        renderList();
-      }
-
-      queueWorkerRunning = false;
-      updateStats();
+        pollInference();
+      }, 80);
     }
 
-    async function runJob(job) {
+    function jobFailed(job, error) {
       const clip = clips.find(c => c.id === job.clipId);
-      if (!clip) return;
+      if (clip) { clip.generating = false; clip.queued = false; clip.inferenceLabel = null; clip.error = error.message; }
+    }
 
-      setStatus(`生成中：${job.synthesis_mode === 'design' ? '描述音色' : job.role}「${job.text.slice(0, 16)}」`);
-      await clip.saving;
-
-      const resp = await apiRequest(job.synthesis_mode === 'design' ? '/api/voice-design' : '/api/tts', {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          role: job.role,
-          emotion: job.emotion,
-          text: job.text,
-          language: job.language,
-          mode: "url",
-          instruct: job.instruct,
-          clip_id: clip.serverId,
-          allow_download: job.allow_download || false,
-        }),
-      });
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-        throw new Error(err.detail || ("HTTP " + resp.status));
+    async function runJobs(jobs) {
+      let ready = [];
+      try {
+        const prepared = await Promise.all(jobs.map(async job => {
+          const clip = clips.find(c => c.id === job.clipId);
+          if (!clip) return null;
+          try {
+            await clip.saving;
+            return {job, clip, payload: {
+              synthesis_mode: job.synthesis_mode === 'design' ? 'design' : 'clone',
+              role: job.role, emotion: job.emotion, text: job.text,
+              language: job.language, mode: 'url', instruct: job.instruct || '',
+              clip_id: clip.serverId, allow_download: job.allow_download || false,
+            }};
+          } catch (error) { jobFailed(job, error); return null; }
+        }));
+        ready = prepared.filter(Boolean);
+        if (!ready.length) return;
+        setStatus(`已提交 ${ready.length} 条，按可用显存自动安排生成`);
+        const submittedAt = performance.now();
+        const response = await apiRequest('/api/generate-batch', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({items: ready.map(item => item.payload)}),
+        });
+        const data = await response.json();
+        if (!Array.isArray(data.items) || data.items.length !== ready.length) throw new Error('批次返回数量不匹配，请刷新语音库确认结果');
+        let failed = 0;
+        data.items.forEach((result, index) => {
+          const {job, clip} = ready[index];
+          if (result.status === 'ok') {
+            applyRecord(clip, result.result.clip);
+            clip.buffer = null; clip.generating = false; clip.queued = false; clip.inferenceLabel = null; clip.error = null;
+          } else {
+            failed++;
+            const detail = result.detail;
+            jobFailed(job, new Error(typeof detail === 'string' ? detail : detail?.message || JSON.stringify(detail)));
+          }
+        });
+        const elapsed = ((performance.now() - submittedAt) / 1000).toFixed(1);
+        setStatus(`本次提交已保存 ${ready.length - failed} 条，共耗时 ${elapsed} 秒（含排队与保存）` + (failed ? `，${failed} 条失败，可单独重试` : ''));
+        if (ready.some(item => item.job.synthesis_mode === 'design')) loadCapabilities();
+      } catch (error) {
+        ready.forEach(({job}) => jobFailed(job, error));
+        setStatus('生成失败：' + error.message);
       }
-      const data = await resp.json();
+    }
 
-      const i = clips.findIndex(c => c.id === job.clipId);
-      if (i < 0) return;
-      applyRecord(clips[i], data.clip);
-      clips[i].buffer = null;
-      clips[i].generating = false;
-      clips[i].queued = false;
-      setStatus('已生成并保存到本地语音库');
-      if (job.synthesis_mode === 'design') loadCapabilities();
+    function inferenceLabel(state, clipId) {
+      if ((state.active_clip_ids || []).includes(clipId)) {
+        if (state.active_phase === 'preparing') return '准备模型';
+        if (state.active_phase === 'calibrating') return '单条生成 · 测量显存';
+        const elapsed = Math.floor(state.active_elapsed_seconds || 0);
+        return (state.active > 1 ? `同批 ${state.active} 条 · ` : '') + `生成中 ${elapsed}s`;
+      }
+      if ((state.queued_clip_ids || []).includes(clipId)) {
+        return state.active_phase === 'calibrating' ? '等待显存测量' : '排队等待';
+      }
+      return '等待本批结果';
+    }
+
+    function generationTimeLabel(clip) {
+      const stats = clip.generation_stats;
+      if (!stats || !Number.isFinite(stats.batch_seconds)) return '';
+      return (stats.batch_size > 1 ? `同批 ${stats.batch_size} 条推理 ` : '单条推理 ') +
+        stats.batch_seconds.toFixed(2) + 's';
+    }
+
+    async function pollInference() {
+      if (inferencePollTimer !== null) return;
+      // Use a sentinel while fetching so several submitters cannot start polls.
+      inferencePollTimer = -1;
+      try {
+        if (!activeJobs.size) return;
+        const state = await (await apiRequest('/api/inference/status')).json();
+        const running = new Set(state.active_clip_ids || []);
+        activeJobs.forEach(job => {
+          const clip = clips.find(c => c.id === job.clipId);
+          if (!clip || (!clip.queued && !clip.generating)) return;
+          clip.generating = running.has(clip.serverId);
+          clip.queued = !clip.generating;
+          clip.inferenceLabel = inferenceLabel(state, clip.serverId);
+          // Do not rebuild editable rows on each poll and steal keyboard focus.
+          const row = listEl.querySelector(`.clip-row[data-id="${clip.id}"]`);
+          if (row) {
+            row.classList.toggle('generating', clip.generating);
+            row.classList.toggle('queued', clip.queued);
+            const badge = row.querySelector('.row-badge');
+            if (badge) badge.textContent = clip.inferenceLabel;
+          }
+        });
+        updateStats();
+      } catch (error) { /* Transient status errors must not cancel generation. */ }
+      finally {
+        inferencePollTimer = activeJobs.size ? setTimeout(() => {
+          inferencePollTimer = null;
+          pollInference();
+        }, 1000) : null;
+      }
     }
 
     // ============================================================
@@ -1958,6 +2124,7 @@
 
       const busy = playlistRunning || singlePlayingId !== null;
       const locked = busy || clip.generating || clip.queued;
+      const staged = jobQueue.some(job => job.clipId === clip.id && !job.released);
       const design = clip.synthesis_mode === 'design';
       const legacy = clip.synthesis_mode === 'legacy';
 
@@ -2067,7 +2234,8 @@
       const meta = document.createElement('div');
       meta.className = 'clip-meta' + (clip.error ? ' clip-error' : '');
       meta.textContent = clip.error || [LANGUAGE_NAMES[clip.language] || clip.language,
-        clip.url ? clip.duration.toFixed(2) + 's' : '未生成',
+        clip.url ? '音频时长 ' + clip.duration.toFixed(2) + 's' : '未生成',
+        clip.url ? generationTimeLabel(clip) : '',
         isDirty(clip) ? '参数已修改 · 待重新生成' : clip.url ? '已保存' : '',
         clip.created_at ? new Date(clip.created_at).toLocaleString() : ''].filter(Boolean).join(' · ');
       info.append(title, textEl, meta);
@@ -2124,10 +2292,12 @@
       // ---- ↻ ----
       const regenIco = document.createElement("button");
       regenIco.className = "icon-btn regen" + (isDirty(clip) ? " hot" : "");
-      regenIco.textContent = "↻";
-      regenIco.title = isDirty(clip) ? "应用修改并重新生成" : "重新生成";
-      regenIco.disabled = locked || legacy;
+      regenIco.textContent = staged ? '↩' : '↻';
+      regenIco.title = staged ? '取消暂存（保留台词）' : autoGenerate.checked ? '重新生成' : '暂存生成任务';
+      regenIco.setAttribute('aria-label', regenIco.title);
+      regenIco.disabled = (staged ? busy : locked) || legacy;
       regenIco.addEventListener("click", async () => {
+        if (staged) { cancelStagedJob(clip.id); return; }
         const t = (clip.text || "").trim();
         if (!t) { setStatus("文本不能为空"); return; }
         if (!design && !clip.role) { setStatus("未选择角色"); return; }
@@ -2148,7 +2318,7 @@
           instruct: clip.instruct,
           allow_download: consent,
         });
-        setStatus("已加入队列");
+        setStatus(autoGenerate.checked ? '已加入生成队列' : '已暂存，点击“开始批量生成”后生成');
       });
 
       // ---- × ----
@@ -2173,10 +2343,10 @@
       // ---- 角标 ----
       const badge = document.createElement("span");
       badge.className = "row-badge";
-      if (clip.generating) badge.textContent = "生成中";
+      if (clip.generating) badge.textContent = clip.inferenceLabel || "生成中";
       else if (clip.queued) {
         const pos = jobQueue.findIndex(j => j.clipId === clip.id);
-        badge.textContent = pos >= 0 ? "排队 #" + (pos + 1) : "排队";
+        badge.textContent = staged ? '已暂存' : clip.inferenceLabel || (pos >= 0 ? "排队 #" + (pos + 1) : "排队");
       }
 
       row.appendChild(grip);
@@ -2437,7 +2607,7 @@
       renderList();
 
       enqueueJob({ clipId, role, emotion, text, language, instruct, synthesis_mode, allow_download });
-      setGenStatus("已加入队列", "ok");
+      setGenStatus(autoGenerate.checked ? '已加入生成队列' : '已暂存，可继续添加下一条', 'ok');
       } catch (error) { setGenStatus('保存失败：' + error.message, 'err'); }
       finally { updateGeneratorMode(); }
     }
@@ -2449,6 +2619,8 @@
     stopBtn.addEventListener("click", stopPlaylist);
     clearBtn.addEventListener("click", () => clearAll());
     genBtn.addEventListener("click", generateClip);
+    startBatchBtn.addEventListener('click', startBatch);
+    autoGenerate.addEventListener('change', changeAutoGenerate);
     genRole.addEventListener("change", onGeneratorRoleChange);
     $('cloneTab').onclick = () => { generatorMode = 'clone'; updateGeneratorMode(); };
     $('designTab').onclick = () => { generatorMode = 'design'; updateGeneratorMode(); };
@@ -2504,6 +2676,8 @@
     // ============================================================
     // 启动
     // ============================================================
+    autoGenerate.checked = false;
+    updateQueueControls();
     updateGeneratorMode();
     loadLibrary();
     loadPTList();

@@ -41,6 +41,7 @@ def load(settings, key=None):
     from .models import prepare_model
 
     device = select_device(settings.device)
+    apply_memory_limit(device, settings)
     path = prepare_model(settings, key=key)
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -56,6 +57,18 @@ def load(settings, key=None):
         attn_implementation="sdpa",
         local_files_only=True,
     )
+
+
+def apply_memory_limit(device, settings, torch_module=None):
+    if torch_module is None:
+        import torch as torch_module
+    torch = torch_module
+    if device.startswith("cuda"):
+        # Bound this process's allocator as well as checking live free memory in
+        # the scheduler. Other applications and CUDA itself also need headroom.
+        torch.cuda.set_per_process_memory_fraction(
+            float(settings.gpu_memory_fraction), device
+        )
 
 
 def free():
