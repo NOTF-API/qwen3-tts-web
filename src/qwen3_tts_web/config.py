@@ -2,6 +2,7 @@
 
 import os
 import re
+import math
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
@@ -29,6 +30,11 @@ class Settings:
     pip_index: str = ""
     torch_index: str = ""
     hf_endpoint: str = ""
+    max_batch_size: int = 64
+    gpu_memory_fraction: float = 0.90
+    gpu_memory_reserve_gb: float = 1.0
+    batch_wait_ms: int = 80
+    max_pending_jobs: int = 128
 
     def __post_init__(self):
         if not re.fullmatch(r"auto|mps|cuda(?::[0-9]+)?", self.device):
@@ -47,6 +53,21 @@ class Settings:
             raise ValueError("offline 必须是布尔值")
         if not isinstance(self.host, str) or not self.host.strip():
             raise ValueError("host 不能为空")
+        for name, low, high in (
+            ("max_batch_size", 1, 64),
+            ("batch_wait_ms", 0, 1000),
+            ("max_pending_jobs", 1, 1024),
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or not low <= value <= high:
+                raise ValueError(f"{name} 必须是 {low}..{high} 的整数")
+        for name, low, high in (
+            ("gpu_memory_fraction", 0.5, 0.95),
+            ("gpu_memory_reserve_gb", 0.25, 64),
+        ):
+            value = getattr(self, name)
+            if type(value) not in (float, int) or not math.isfinite(value) or not low <= value <= high:
+                raise ValueError(f"{name} 必须在 {low}..{high} 之间")
         for name in ("pip_index", "torch_index", "hf_endpoint"):
             value = getattr(self, name)
             if not isinstance(value, str) or (
@@ -99,8 +120,10 @@ def load_settings(root=None, overrides=None):
         name = f"QWEN3_TTS_{key.upper()}"
         if name in os.environ:
             value = os.environ[name]
-            if key == "port":
+            if key in {"port", "max_batch_size", "batch_wait_ms", "max_pending_jobs"}:
                 value = int(value)
+            elif key in {"gpu_memory_fraction", "gpu_memory_reserve_gb"}:
+                value = float(value)
             elif key == "offline":
                 if value.lower() not in ("true", "false", "1", "0"):
                     raise ValueError(f"{name} 必须是 true/false/1/0")

@@ -9,3 +9,12 @@ offline = false
 pip_index = ""
 torch_index = ""
 hf_endpoint = ""
+
+# 自动批量推理：先单条测量，再按实时空闲显存和峰值逐步增加。
+# max_batch_size = 1 可关闭并行；MPS / 无法测量显存时保守使用单条。
+max_batch_size = 64
+gpu_memory_fraction = 0.90
+gpu_memory_reserve_gb = 1.0
+# Mac 保持原有单条推理和内存管理，不使用以上 CUDA 显存门槛。
+batch_wait_ms = 80
+max_pending_jobs = 128

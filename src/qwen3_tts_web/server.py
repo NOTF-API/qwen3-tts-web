@@ -12,6 +12,7 @@ pt 目录结构：
 """
 
 import dataclasses
+import asyncio
 import inspect
 import json
 import os
@@ -30,10 +31,12 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 
 from .config import load_settings
 from .library import AudioLibrary
-from .runtime import free, load
+from .runtime import apply_memory_limit, free, load
+from .inference import InferenceError, InferenceScheduler, Job
 
 settings = load_settings()
 BASE_DIR = settings.root
@@ -66,6 +69,7 @@ VOICE_CLONE_PROMPT_ITEM = None
 model = None
 active_model_key = settings.model_key
 inference_lock = threading.Lock()
+generation_claims = set()
 
 
 def get_model(key, allow_download=False):
@@ -108,10 +112,15 @@ async def lifespan(app):
         active_model_key = settings.model_key
         AudioLibrary(OUT_DIR).list()
         VOICE_CLONE_PROMPT_ITEM, _ = _find_prompt_item_cls()
+        app.state.scheduler = InferenceScheduler(settings, get_model, inference_lock)
+        app.state.scheduler.start()
         app.state.ready = True
         yield
     finally:
         app.state.ready = False
+        if app.state.scheduler is not None:
+            await run_in_threadpool(app.state.scheduler.close)
+            app.state.scheduler = None
         model = None
         free()
 
@@ -124,6 +133,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.state.ready = False
+app.state.scheduler = None
 app.mount("/web", StaticFiles(directory=str(WEB_DIR)), name="web")
 
 
@@ -170,7 +180,7 @@ Emotion = Annotated[str, BeforeValidator(normalize_emotion)]
 class TTSRequest(BaseModel):
     role: str = ""
     emotion: Emotion = "平静"
-    text: str
+    text: str = Field(min_length=1, max_length=10000)
     language: str = "Chinese"
     mode: str = "url"  # "url" | "file"
     pt_file: str = ""  # 兼容旧接口
@@ -191,6 +201,21 @@ class VoiceDesignRequest(BaseModel):
         if not value.strip():
             raise ValueError("文本与音色描述不能为空")
         return value.strip()
+
+
+class BatchCloneRequest(TTSRequest):
+    synthesis_mode: Literal["clone"] = "clone"
+    mode: Literal["url"] = "url"
+
+
+class BatchDesignRequest(VoiceDesignRequest):
+    synthesis_mode: Literal["design"] = "design"
+    mode: Literal["url"] = "url"
+
+
+class BatchRequest(BaseModel):
+    items: list[Annotated[BatchCloneRequest | BatchDesignRequest,
+                          Field(discriminator="synthesis_mode")]] = Field(min_length=1, max_length=32)
 
 
 class ClipEdit(BaseModel):
@@ -307,6 +332,7 @@ def capabilities():
     from .models import MODELS, model_path, validate_model
 
     errors = validate_model(model_path(settings, "voicedesign"), "voicedesign")
+    cuda = str(getattr(model, "device", settings.device)).startswith("cuda")
     return {
         "voice_design": {
             "model": MODELS["voicedesign"],
@@ -314,7 +340,21 @@ def capabilities():
             "offline": settings.offline,
         },
         "active_model": MODELS[active_model_key],
+        "inference": {
+            "mode": "adaptive_batch" if cuda else "serial",
+            "max_batch_size": settings.max_batch_size if cuda else 1,
+            "max_request_items": min(32, settings.max_pending_jobs) if cuda else 1,
+            "gpu_memory_fraction": settings.gpu_memory_fraction,
+        },
     }
+
+
+@app.get("/api/inference/status", summary="自适应生成队列与最近一次显存测量")
+async def inference_status():
+    scheduler = app.state.scheduler
+    if scheduler is None:
+        raise HTTPException(503, detail="推理队列尚未就绪")
+    return scheduler.status()
 
 
 class PromptCreateRequest(BaseModel):
@@ -531,7 +571,10 @@ def api_pt_create(req: PromptCreateRequest):
 
     try:
         with inference_lock:
-            prompt = get_model(settings.model_key).create_voice_clone_prompt(**kwargs)
+            target = get_model(settings.model_key)
+            apply_memory_limit(str(target.device), settings)
+            prompt = target.create_voice_clone_prompt(**kwargs)
+            del target
     except HTTPException:
         raise
     except Exception as e:
@@ -609,7 +652,46 @@ def api_pt_inspect(role: str = "", emotion: str = "平静", name: str = ""):
 
 # ================= API：TTS =================
 @app.post("/api/tts", summary="生成语音（role+emotion 或 pt_file）")
-def api_tts(req: TTSRequest):
+async def api_tts(req: TTSRequest):
+    async with claim_generation(req.clip_id):
+        prompt_list = await run_in_threadpool(prepare_tts, req)
+        job = Job(
+            key=settings.model_key, text=req.text, language=req.language,
+            prompt=prompt_list[0], clip_id=req.clip_id,
+        )
+        wav, sr = await schedule(job)
+        generated = {
+            "role": req.role, "emotion": req.emotion, "text": req.text,
+            "language": req.language, "synthesis_mode": "clone", "instruct": "",
+        }
+        return await run_in_threadpool(save_generation, req, [wav], sr, generated, job.generation_stats)
+
+
+@asynccontextmanager
+async def claim_generation(clip_id):
+    # All callers run on the event loop. Hold the claim through disk persistence,
+    # so two tabs cannot race to replace the same clip after inference finishes.
+    if clip_id and clip_id in generation_claims:
+        raise HTTPException(409, detail="这条语音正在生成，请等待完成")
+    if clip_id:
+        generation_claims.add(clip_id)
+    try:
+        yield
+    finally:
+        generation_claims.discard(clip_id)
+
+
+async def schedule(job):
+    scheduler = app.state.scheduler
+    if scheduler is None:
+        raise HTTPException(503, detail="推理队列尚未就绪")
+    try:
+        return await asyncio.wrap_future(scheduler.submit(job))
+    except InferenceError as exc:
+        raise HTTPException(exc.status_code, detail=str(exc)) from None
+
+
+def prepare_tts(req):
     if not req.text.strip():
         raise HTTPException(400, detail="文本不能为空")
     if req.clip_id:
@@ -630,35 +712,13 @@ def api_tts(req: TTSRequest):
             )
 
     prompt_list = load_prompt_from_path(p)
-
-    try:
-        with inference_lock:
-            wavs, sr = get_model(settings.model_key).generate_voice_clone(
-                text=req.text,
-                language=req.language,
-                voice_clone_prompt=prompt_list,
-            )
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-
-        traceback.print_exc()
-        raise HTTPException(500, detail=f"生成失败: {e}")
-
-    generated = {
-        "role": req.role,
-        "emotion": req.emotion,
-        "text": req.text,
-        "language": req.language,
-        "synthesis_mode": "clone",
-        "instruct": "",
-    }
-    return save_generation(req, wavs, sr, generated)
+    if len(prompt_list) != 1:
+        raise HTTPException(400, detail="单条语音需要一个音色 prompt；请使用只包含一个音色的 .pt 文件")
+    return prompt_list
 
 
-def save_generation(req, wavs, sr, generated):
-    metadata = {"generated": generated}
+def save_generation(req, wavs, sr, generated, generation_stats=None):
+    metadata = {"generated": generated, "generation_stats": generation_stats or {}}
     if not req.clip_id:
         metadata.update(generated, title=req.text[:60])
     try:
@@ -683,31 +743,39 @@ def save_generation(req, wavs, sr, generated):
 
 
 @app.post("/api/voice-design", summary="通过自然语言描述设计音色并生成语音")
-def api_voice_design(req: VoiceDesignRequest):
-    if req.clip_id:
-        library_record(req.clip_id)
-    try:
-        with inference_lock:
-            wavs, sr = get_model(
-                "voicedesign", req.allow_download
-            ).generate_voice_design(
-                text=req.text,
-                language=req.language,
-                instruct=req.instruct,
-            )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(500, detail=f"音色设计失败: {exc}")
-    generated = {
-        "text": req.text,
-        "language": req.language,
-        "instruct": req.instruct,
-        "synthesis_mode": "design",
-        "role": "",
-        "emotion": "平静",
-    }
-    return save_generation(req, wavs, sr, generated)
+async def api_voice_design(req: VoiceDesignRequest):
+    async with claim_generation(req.clip_id):
+        if req.clip_id:
+            await run_in_threadpool(library_record, req.clip_id)
+        job = Job(
+            key="voicedesign", text=req.text, language=req.language,
+            instruct=req.instruct, allow_download=req.allow_download, clip_id=req.clip_id,
+        )
+        wav, sr = await schedule(job)
+        generated = {
+            "text": req.text, "language": req.language, "instruct": req.instruct,
+            "synthesis_mode": "design", "role": "", "emotion": "平静",
+        }
+        return await run_in_threadpool(save_generation, req, [wav], sr, generated, job.generation_stats)
+
+
+@app.post("/api/generate-batch", summary="批量提交语音，每条任务独立返回结果")
+async def api_generate_batch(req: BatchRequest):
+    async def generate(item):
+        try:
+            result = await (api_tts(item) if item.synthesis_mode == "clone" else api_voice_design(item))
+            return {"status": "ok", "result": result}
+        except HTTPException as exc:
+            return {"status": "error", "status_code": exc.status_code, "detail": exc.detail}
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception("生成任务失败")
+            return {"status": "error", "status_code": 500, "detail": "生成失败，请查看服务日志"}
+
+    # Waiting on futures consumes no worker-pool thread, leaving health, uploads
+    # and the library responsive even with a large inference backlog.
+    return {"items": await asyncio.gather(*(generate(item) for item in req.items))}
 
 
 # ================= 上传 & maker 页面 =================
